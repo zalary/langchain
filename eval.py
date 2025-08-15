@@ -1,58 +1,80 @@
 from langsmith.client import Client
+from langchain_groq import ChatGroq
+from judge import HelpfulnessJudge
 from langsmith.evaluation import RunEvaluator, EvaluationResult
-from langchain.chat_models import ChatOpenAI
 from langchain.evaluation import load_evaluator
+from langsmith.run_helpers import trace
 from agent import graph  # your compiled LangGraph
-from test_cases import test_cases
+from dataset import test_cases
+from dotenv import load_dotenv
+load_dotenv()
 
 PROJECT_NAME = "langgraph-tiered-support"
+client = Client()
 
-# Custom evaluator: did the assistant enforce access policy correctly?
+# Optional: Evaluate using a dataset from LangSmith
+def evaluate_with_dataset(dataset_name: str):
+    dataset = client.read_dataset(name=dataset_name)
+
+    client.run_on_dataset(
+        dataset_name=dataset.name,
+        llm_or_chain_factory=lambda: graph,
+        evaluators=[HelpfulnessJudge()],
+        input_mapper=lambda x: x,
+        verbose=True,
+    )
+
+# Custom evaluator: Did the assistant enforce access correctly?
 class TierAccessJudge(RunEvaluator):
     def __init__(self):
+        groq_llm = ChatGroq(temperature=0, model="llama3-70b-8192")
         self.judge = load_evaluator(
             "labeled_criteria",
-            criteria=["correctness"],
-            llm=ChatOpenAI(temperature=0)
+            criteria={"correctness": "Was the access decision correct?"},
+            llm=groq_llm 
         )
 
     def evaluate_run(self, run, example=None):
-        # Pass input, output, and expected access to judge
-        user_input = run.inputs["messages"][-1]["content"]
+        question = run.inputs["messages"][-1]["content"]
+        answer = run.outputs["messages"][-1]["content"]
         expected = example["expect_access"]
-        expected_str = "should allow access" if expected else "should deny access"
+        reference = "should allow access" if expected else "should deny access"
 
         return self.judge.evaluate_strings(
-            input=user_input,
-            prediction=run.outputs["messages"][-1]["content"],
-            reference=expected_str
+            input=question,
+            prediction=answer,
+            reference=reference,
         )
 
-# Log + evaluate
-def main():
-    client = Client()
+# Manual test case evaluation
+def evaluate_test_cases():
     evaluator = TierAccessJudge()
-
     for case in test_cases:
+        if "expect_access" not in case:
+            raise ValueError(f"Missing 'expect_access' in test case: {case['name']}")
         inputs = case["inputs"]
-        example = {
-            "expect_access": case["expect_access"]
-        }
+        expected = case["expect_access"]
 
         output = graph.invoke(inputs, config={"configurable": {"user_name": "LangSmith"}})
 
-        run = client.create_run_from_state(
-            name=case["name"],
+        run = client.create_run(
+            run_type="chain",
+            name=case.get("name", "Unnamed Case"),
             inputs=inputs,
             outputs=output,
             project_name=PROJECT_NAME,
-            reference_output="should allow access" if case["expect_access"] else "should deny access",
+            reference_output="should allow access" if expected else "should deny access",
         )
 
-        eval_result: EvaluationResult = evaluator.evaluate_run(run, example)
-        client.log_evaluation(run_id=run.id, evaluation=eval_result)
+        if run is None or not hasattr(run, "inputs") or run.inputs is None:
+            print(f"Skipping case {case.get('name', 'Unnamed Case')} due to missing run inputs")
+            continue
 
-        print(f"{case['name']}: {eval_result.score} — {eval_result.comment}")
+        result: EvaluationResult = evaluator.evaluate_run(run, {"expect_access": expected})
+        client.log_evaluation(run.id, result)
+        print(f"{case['name']}: {result.score} — {result.comment}")
 
 if __name__ == "__main__":
-    main()
+    # Choose one:
+    # evaluate_with_dataset("Support Questions")
+    evaluate_test_cases()
