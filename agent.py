@@ -3,8 +3,13 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.prebuilt.chat_agent_executor import AgentState
 from langgraph.prebuilt import create_react_agent
 from langgraph.graph import StateGraph, END
+from typing_extensions import TypedDict, Literal
+from langchain_core.runnables import RunnableLambda
 from dotenv import load_dotenv
 load_dotenv()
+
+# class SupportContext(TypedDict):
+#     customer_tier: Literal["Free", "Pro", "Enterprise"]
 
 stub_docs = {
     "tracing": "Tracing helps debug chains and agents by recording structured run data. Tracing is available for Pro and Enterprise tiers.",
@@ -13,16 +18,19 @@ stub_docs = {
     "langsmith eval": "LangSmith supports LLM-as-a-judge, scoring functions, and dataset evaluation for agents and chains."
 }
 
-def init_state_node(state: AgentState) -> AgentState:
-    # Simulate a customer tier and input
+def init_state_node(state: AgentState, config: RunnableConfig) -> AgentState:
+    print("INIT STATE DEBUG:", state)
+    state = dict(state)
+    tier = config["configurable"].get("customer_tier", "Free")
     return {
         **state,
-        "customer_tier": state.get("customer_tier", "Pro"),  # don't overwrite if already set
-        "question": state["messages"][-1].content  # last user message
+        "question": state["messages"][-1].content,
+         "customer_tier": tier
     }
 
-def check_access(state: AgentState) -> AgentState:
-    tier = state.get("customer_tier", "Free")
+def check_access(state: AgentState, config: RunnableConfig) -> AgentState:
+    tier = config["configurable"].get("customer_tier", "Free")
+    print("DEBUG: customer_tier =", tier)
     can_access = tier in ("Pro", "Enterprise")
     return {**state, "can_access": can_access}
 
@@ -53,7 +61,7 @@ def classify_topic(state: AgentState) -> AgentState:
 
 def prompt(state: AgentState, config: RunnableConfig) -> list[AnyMessage]:  
     user_name = config["configurable"].get("user_name")
-    tier = state.get("customer_tier", "Free")
+    tier = config["configurable"].get("customer_tier", state.get("customer_tier", "Free")),
     topic = state.get("topic")
     can_access = state.get("can_access")
     stub_answer = state.get("retrieved_doc")
@@ -78,11 +86,11 @@ agent = create_react_agent(
 # Create a new graph builder
 builder = StateGraph(AgentState)
 # Add a node to inject tier and extract question
-builder.add_node("init", init_state_node)
+builder.add_node("init", RunnableLambda(init_state_node))
 # Add nodes
 builder.add_node("agent", agent)
-builder.add_node("check_access", check_access)
 builder.add_node("retrieve_doc", retrieve_doc)
+builder.add_node("check_access", RunnableLambda(check_access))
 # Classify the topic
 builder.add_node("classify_topic", classify_topic)
 # Wire the nodes together
@@ -96,12 +104,16 @@ builder.add_edge("agent", END)
 # Compile the runnable graph
 graph = builder.compile()
 
+
 # Run the agent
+input_state = {
+    "messages": [{"role": "user", "content": "How do I enable tracing in LangChain?"}],
+    "customer_tier": "Pro"
+}
 result = graph.invoke(
-    {
-        "messages": [{"role": "user", "content": "How do I enable tracing in LangChain?"}],
-        "customer_tier": "Pro"
+     {
+        "messages": [{"role": "user", "content": "How do I enable tracing in LangChain?"}]
     },
-    config={"configurable": {"user_name": "John Smith"}}
+    config={"configurable": {"user_name": "John Smith", "customer_tier": "Pro"}}
 )
 print(result)

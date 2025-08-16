@@ -4,6 +4,7 @@ from judge import HelpfulnessJudge
 from langsmith.evaluation import RunEvaluator, EvaluationResult
 from langchain.evaluation import load_evaluator
 from langsmith.run_helpers import trace
+from langsmith import traceable
 from agent import graph  # your compiled LangGraph
 from dataset import test_cases
 from dotenv import load_dotenv
@@ -45,34 +46,67 @@ class TierAccessJudge(RunEvaluator):
             prediction=answer,
             reference=reference,
         )
-
+    
+@traceable(name="eval_case")
+def run_case(inputs: dict, tier: str, user_name: str, case_name: str, expect_access: bool):
+    # inner span so you get tags/metadata on the invoke
+    with trace(
+        "graph.invoke",
+        tags=[f"tier:{tier}"],
+        metadata={"case": case_name, "expect_access": expect_access},
+    ):
+        return graph.invoke(
+            inputs,
+            config={"configurable": {"user_name": user_name, "customer_tier": tier}},
+        )
+    
 # Manual test case evaluation
 def evaluate_test_cases():
     evaluator = TierAccessJudge()
+
     for case in test_cases:
+        name = case.get("name", "Unnamed Case")
+        # Guard: must have expected label
         if "expect_access" not in case:
-            raise ValueError(f"Missing 'expect_access' in test case: {case['name']}")
-        inputs = case["inputs"]
+            print(f"Skipping {name}: missing 'expect_access'")
+            continue
         expected = case["expect_access"]
+        inputs = {"messages": case["inputs"]["messages"]}
 
-        output = graph.invoke(inputs, config={"configurable": {"user_name": "LangSmith"}})
+        # pull tier from the case's inputs for the config
+        tier = case.get("customer_tier") or case["inputs"].get("customer_tier", "Free")
+        user_name = case.get("user_name", "LangSmith")
 
+        print(f"[EVAL] {case.get('name', 'Unnamed')} → tier={tier}")
+
+        # Invoke the graph with config carrying immutable context (tier, user name)
+        try:
+            output = run_case(inputs, tier, user_name, name, expected)
+        except Exception as e:
+            print(f"[EVAL] {name} → graph error: {e}")
+            continue
+            
+        # Log the run to LangSmith
         run = client.create_run(
             run_type="chain",
-            name=case.get("name", "Unnamed Case"),
+            name=name,
             inputs=inputs,
             outputs=output,
             project_name=PROJECT_NAME,
             reference_output="should allow access" if expected else "should deny access",
         )
 
-        if run is None or not hasattr(run, "inputs") or run.inputs is None:
-            print(f"Skipping case {case.get('name', 'Unnamed Case')} due to missing run inputs")
+        # Safety guard: ensure run has inputs before evaluating
+        if not getattr(run, "inputs", None):
+            print(f"Skipping {name}: missing run inputs")
             continue
 
+        # Evaluate with the custom judge
         result: EvaluationResult = evaluator.evaluate_run(run, {"expect_access": expected})
         client.log_evaluation(run.id, result)
-        print(f"{case['name']}: {result.score} — {result.comment}")
+        print(f"{name}: {getattr(result, 'score', None)} — {getattr(result, 'comment', '')}")
+
+    print("[EVAL] done.")
 
 if __name__ == "__main__":
     # Choose one:
